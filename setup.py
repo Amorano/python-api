@@ -12,11 +12,14 @@
 import sys
 from setuptools import setup, find_packages
 
+
 f = open('README.md')
 readme = f.read().strip()
 
 f = open('LICENSE')
 license = f.read().strip()
+
+script_args = sys.argv[1:]
 
 setup(
     name='shotgun_api3',
@@ -28,7 +31,7 @@ setup(
     url='https://github.com/shotgunsoftware/python-api',
     license=license,
     packages=find_packages(exclude=('tests',)),
-    script_args=sys.argv[1:],
+    script_args=script_args,
     include_package_data=True,
     package_data={'': ['cacerts.txt', 'cacert.pem']},
     zip_safe=False,
@@ -43,4 +46,8 @@ setup(
         "Programming Language :: Python :: 3.11",
         "Operating System :: OS Independent",
     ],
+    install_requires=[
+          'httplib2>=0.19.1',
+          'certifi>=2022.12.7',
+      ],
 )

@@ -29,40 +29,34 @@
  OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 """
 
-# Python 2/3 compatibility
-from .lib import six
-from .lib import sgsix
-from .lib import sgutils
-from .lib.six import BytesIO               # used for attachment upload
-from .lib.six.moves import map
+import io
 
-from .lib.six.moves import http_cookiejar  # used for attachment upload
 import datetime
 import logging
-import uuid                                # used for attachment upload
+import uuid         # used for attachment upload
 import os
 import re
 import copy
-import ssl
-import stat                                # used for attachment upload
+import stat         # used for attachment upload
 import sys
 import time
 import json
-from .lib.six.moves import urllib
 import shutil       # used for attachment download
-from .lib.six.moves import http_client      # Used for secure file upload.
-from .lib.httplib2 import Http, ProxyInfo, socks, ssl_error_classes
+import certifi
+import urllib.parse, urllib.request, urllib.error
+import mimetypes
+
+from httplib2 import Http, ProxyInfo, socks
+from http import client as http_client
+from http import cookiejar as http_cookiejar
+
 from .lib.sgtimezone import SgTimezone
 
-# Import Error and ResponseError (even though they're unused in this file) since they need
-# to be exposed as part of the API.
-from .lib.six.moves.xmlrpc_client import Error, ProtocolError, ResponseError  # noqa
+from xmlrpc.client import ProtocolError, ResponseError, Error
 
-if six.PY3:
-    from base64 import encodebytes as base64encode
-else:
-    from base64 import encodestring as base64encode
+from base64 import encodebytes as base64encode
 
+ENCODING = "utf8"
 
 LOG = logging.getLogger("shotgun_api3")
 """
@@ -74,30 +68,6 @@ handler associated with it.
 .. seealso:: :ref:`logging`
 """
 LOG.setLevel(logging.WARN)
-
-
-def _is_mimetypes_broken():
-    """
-    Checks if this version of Python ships with a broken version of mimetypes
-
-    :returns: True if the version of mimetypes is broken, False otherwise.
-    """
-    # mimetypes is broken on Windows only and for Python 2.7.0 to 2.7.9 inclusively.
-    # We're bundling the version from 2.7.10.
-    # See bugs :
-    # http://bugs.python.org/issue9291  <- Fixed in 2.7.7
-    # http://bugs.python.org/issue21652 <- Fixed in 2.7.8
-    # http://bugs.python.org/issue22028 <- Fixed in 2.7.10
-    return (sys.platform == "win32" and
-            sys.version_info[0] == 2 and sys.version_info[1] == 7 and
-            sys.version_info[2] >= 0 and sys.version_info[2] <= 9)
-
-
-if _is_mimetypes_broken():
-    from .lib import mimetypes as mimetypes
-else:
-    import mimetypes
-
 
 # mimetypes imported in version specific imports
 mimetypes.add_type("video/webm", ".webm")  # webm and mp4 seem to be missing
@@ -115,6 +85,16 @@ Sometimes there are cases where certificate validation should be disabled. For e
 have a self-signed internal certificate that isn't included in our certificate bundle, you may
 not require the added security provided by enforcing this.
 """
+try:
+    import ssl
+except ImportError as e:
+    if "SHOTGUN_FORCE_CERTIFICATE_VALIDATION" in os.environ:
+        raise ImportError("%s. SHOTGUN_FORCE_CERTIFICATE_VALIDATION environment variable prevents "
+                          "disabling SSL certificate validation." % e)
+    LOG.debug("ssl not found, disabling certificate validation")
+    NO_SSL_VALIDATION = True
+else:
+    ssl_error_classes = (ssl.SSLError, ssl.CertificateError)
 
 # ----------------------------------------------------------------------------
 # Version
@@ -651,11 +631,11 @@ class Shotgun(object):
         if self.config.rpc_attempt_interval < 0:
             raise ValueError("Value of SHOTGUN_API_RETRY_INTERVAL must be positive, "
                              "got '%s'." % self.config.rpc_attempt_interval)
-        
+
         global SHOTGUN_API_DISABLE_ENTITY_OPTIMIZATION
         if os.environ.get("SHOTGUN_API_DISABLE_ENTITY_OPTIMIZATION", "0").strip().lower() == "1":
             SHOTGUN_API_DISABLE_ENTITY_OPTIMIZATION = True
-            
+
         self._connection = None
 
         self.__ca_certs = self._get_certs_file(ca_certs)
@@ -672,8 +652,7 @@ class Shotgun(object):
         # the lowercase version of the credentials.
         auth, self.config.server = self._split_url(base_url)
         if auth:
-            auth = base64encode(sgutils.ensure_binary(
-                urllib.parse.unquote(auth))).decode("utf-8")
+            auth = base64encode(urllib.parse.unquote(auth).encode(ENCODING)).decode(ENCODING)
             self.config.authorization = "Basic " + auth.strip()
 
         # foo:bar@123.456.789.012:3456
@@ -735,22 +714,18 @@ class Shotgun(object):
         In python 3.8 `urllib.parse.splituser` was deprecated warning devs to
         use `urllib.parse.urlparse`.
         """
-        if six.PY38:
-            auth = None
-            results = urllib.parse.urlparse(base_url)
-            server = results.hostname
-            if results.port:
-                server = "{}:{}".format(server, results.port)
+        auth = None
+        results = urllib.parse.urlparse(base_url)
+        server = results.hostname
 
-            if results.username:
-                auth = results.username
+        if results.port:
+            server = "{}:{}".format(server, results.port)
 
-                if results.password:
-                    auth = "{}:{}".format(auth, results.password)
+        if results.username:
+            auth = results.username
 
-        else:
-            auth, server = urllib.parse.splituser(
-                urllib.parse.urlsplit(base_url).netloc)
+            if results.password:
+                auth = "{}:{}".format(auth, results.password)
 
         return auth, server
 
@@ -959,7 +934,7 @@ class Shotgun(object):
             Defaults to ``["id"]``.
 
             .. seealso:: :ref:`combining-related-queries`
-            
+
         :param list order: Optional list of dictionaries defining how to order the results of the
             query. Each dictionary contains the ``field_name`` to order by and  the ``direction``
             to sort::
@@ -1132,7 +1107,7 @@ class Shotgun(object):
             params["project"] = project_entity
 
         return params
-    
+
     def _translate_update_params(
         self, entity_type, entity_id, data, multi_entity_update_modes
     ):
@@ -2153,7 +2128,7 @@ class Shotgun(object):
             "field_name": field_name,
             "properties": [
                 {"property_name": k, "value": v}
-                for k, v in six.iteritems((properties or {}))
+                for k, v in (properties or {}).items()
             ]
         }
         params = self._add_project_param(params, project_entity)
@@ -2246,7 +2221,7 @@ class Shotgun(object):
         .. note::
             When sharing a filmstrip thumbnail, it is required to have a static thumbnail in
             place before the filmstrip will be displayed in the Shotgun web UI.
-            If the :ref:`thumbnail is still processing and is using a placeholder 
+            If the :ref:`thumbnail is still processing and is using a placeholder
             <interpreting_image_field_strings>`, this method will error.
 
         Simple use case:
@@ -2273,7 +2248,7 @@ class Shotgun(object):
             share the static thumbnail. Defaults to ``False``.
         :returns: ``id`` of the Attachment entity representing the source thumbnail that is shared.
         :rtype: int
-        :raises: :class:`ShotgunError` if not supported by server version or improperly called, 
+        :raises: :class:`ShotgunError` if not supported by server version or improperly called,
             or :class:`ShotgunThumbnailNotReady` if thumbnail is still pending.
         """
         if not self.server_caps.version or self.server_caps.version < (4, 0, 0):
@@ -2434,7 +2409,7 @@ class Shotgun(object):
         assign tags to the Attachment.
 
         .. note::
-          Make sure to have retries for file uploads. Failures when uploading will occasionally happen. 
+          Make sure to have retries for file uploads. Failures when uploading will occasionally happen.
           When it does, immediately retrying to upload usually works
 
         >>> mov_file = '/data/show/ne2/100_110/anim/01.mlk-02b.mov'
@@ -2743,9 +2718,8 @@ class Shotgun(object):
                 elif e.code == 403:
                     # Only parse the body if it is an Amazon S3 url.
                     if url.find("s3.amazonaws.com") != -1 and e.headers["content-type"] == "application/xml":
-                        body = [sgutils.ensure_text(line) for line in e.readlines()]
-                        if body:
-                            xml = "".join(body)
+                        xml = str(e.read())
+                        if xml:
                             # Once python 2.4 support is not needed we can think about using
                             # elementtree. The doc is pretty small so this shouldn't be an issue.
                             match = re.search("<Message>(.*)</Message>", xml)
@@ -3059,7 +3033,7 @@ class Shotgun(object):
             raise ValueError("entity_types parameter must be a dictionary")
 
         api_entity_types = {}
-        for (entity_type, filter_list) in six.iteritems(entity_types):
+        for (entity_type, filter_list) in entity_types.items():
 
             if isinstance(filter_list, (list, tuple)):
                 resolved_filters = _translate_filters(filter_list, filter_operator=None)
@@ -3283,7 +3257,6 @@ class Shotgun(object):
         return self._call_rpc("user_subscriptions_read", None)
 
     def user_subscriptions_create(self, users):
-        # type: (list[dict[str, Union[str, list[str], None]) -> bool
         """
         Assign subscriptions to users.
 
@@ -3567,7 +3540,7 @@ class Shotgun(object):
         """
 
         wire = json.dumps(payload, ensure_ascii=False)
-        return sgutils.ensure_binary(wire)
+        return wire.encode(ENCODING)
 
     def _make_call(self, verb, path, body, headers):
         """
@@ -3668,7 +3641,7 @@ class Shotgun(object):
         http_status = (resp.status, resp.reason)
         resp_headers = dict(
             (k.lower(), v)
-            for k, v in six.iteritems(resp)
+            for k, v in resp.items()
         )
         resp_body = content
 
@@ -3742,21 +3715,15 @@ class Shotgun(object):
         def _decode_list(lst):
             newlist = []
             for i in lst:
-                if isinstance(i, str):
-                    i = sgutils.ensure_str(i)
-                elif isinstance(i, list):
+                if isinstance(i, list):
                     i = _decode_list(i)
                 newlist.append(i)
             return newlist
 
         def _decode_dict(dct):
             newdict = {}
-            for k, v in six.iteritems(dct):
-                if isinstance(k, str):
-                    k = sgutils.ensure_str(k)
-                if isinstance(v, str):
-                    v = sgutils.ensure_str(v)
-                elif isinstance(v, list):
+            for k, v in dct.items():
+                if isinstance(v, list):
                     v = _decode_list(v)
                 newdict[k] = v
             return newdict
@@ -3819,7 +3786,7 @@ class Shotgun(object):
         if isinstance(data, dict):
             return dict(
                 (k, recursive(v, visitor))
-                for k, v in six.iteritems(data)
+                for k, v in data.items()
             )
 
         return visitor(data)
@@ -3864,10 +3831,6 @@ class Shotgun(object):
                 if _change_tz:
                     value = _change_tz(value)
                 return value.strftime("%Y-%m-%dT%H:%M:%SZ")
-
-            # ensure return is six.text_type
-            if isinstance(value, str):
-                return sgutils.ensure_text(value)
 
             return value
 
@@ -3969,7 +3932,7 @@ class Shotgun(object):
                 continue
 
             # iterate over each item and check each field for possible injection
-            for k, v in six.iteritems(rec):
+            for k, v in rec.items():
                 if not v:
                     continue
 
@@ -4037,7 +4000,7 @@ class Shotgun(object):
         [{'field_name': 'foo', 'value': 'bar', 'thing1': 'value1'}]
         """
         ret = []
-        for k, v in six.iteritems((d or {})):
+        for k, v in (d or {}).items():
             d = {key_name: k, value_name: v}
             d.update((extra_data or {}).get(k, {}))
             ret.append(d)
@@ -4050,7 +4013,7 @@ class Shotgun(object):
 
         e.g. d {'foo' : 'bar'} changed to {'foo': {"value": 'bar'}]
         """
-        return dict([(k, {key_name: v}) for (k, v) in six.iteritems((d or {}))])
+        return dict([(k, {key_name: v}) for (k, v) in (d or {}).items()])
 
     def _upload_file_to_storage(self, path, storage_url):
         """
@@ -4096,7 +4059,7 @@ class Shotgun(object):
                 data_size = len(data)
                 # keep data as a stream so that we don't need to worry how it was
                 # encoded.
-                data = BytesIO(data)
+                data = io.BytesIO(data)
                 bytes_read += data_size
                 part_url = self._get_upload_part_link(upload_info, filename, part_number)
                 etags.append(self._upload_data_to_storage(data, content_type, data_size, part_url))
@@ -4288,7 +4251,7 @@ class Shotgun(object):
                 else:
                     raise ShotgunError("Unanticipated error occurred %s" % (e))
 
-            return sgutils.ensure_text(result)
+            return result if isinstance(result, str) else result.decode(ENCODING)
         else:
             raise ShotgunError("Max attemps limit reached.")
 
@@ -4315,20 +4278,12 @@ class CACertsHTTPSConnection(http_client.HTTPConnection):
         "Connect to a host on a given (SSL) port."
         http_client.HTTPConnection.connect(self)
         # Now that the regular HTTP socket has been created, wrap it with our SSL certs.
-        if six.PY38:
-            context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-            context.verify_mode = ssl.CERT_REQUIRED
-            context.check_hostname = False
-            if self.__ca_certs:
-                context.load_verify_locations(self.__ca_certs)
-            self.sock = context.wrap_socket(self.sock)
-        else:
-            self.sock = ssl.wrap_socket(
-                self.sock,
-                ca_certs=self.__ca_certs,
-                cert_reqs=ssl.CERT_REQUIRED
-            )
-
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        context.verify_mode = ssl.CERT_REQUIRED
+        context.check_hostname = False
+        if self.__ca_certs:
+            context.load_verify_locations(self.__ca_certs)
+        self.sock = context.wrap_socket(self.sock)
 
 class CACertsHTTPSHandler(urllib.request.HTTPSHandler):
     """
@@ -4357,30 +4312,24 @@ class FormPostHandler(urllib.request.BaseHandler):
     def http_request(self, request):
         # get_data was removed in 3.4. since we're testing against 3.6 and
         # 3.7, this should be sufficient.
-        if six.PY3:
-            data = request.data
-        else:
-            data = request.get_data()
+        data = request.data
         if data is not None and not isinstance(data, str):
             files = []
             params = []
             for key, value in data.items():
-                if isinstance(value, sgsix.file_types):
+                if isinstance(value, io.IOBase):
                     files.append((key, value))
                 else:
                     params.append((key, value))
             if not files:
-                data = sgutils.ensure_binary(urllib.parse.urlencode(params, True))  # sequencing on
+                data = urllib.parse.urlencode(params, True).encode(ENCODING)  # sequencing on
             else:
                 boundary, data = self.encode(params, files)
                 content_type = "multipart/form-data; boundary=%s" % boundary
                 request.add_unredirected_header("Content-Type", content_type)
             # add_data was removed in 3.4. since we're testing against 3.6 and
             # 3.7, this should be sufficient.
-            if six.PY3:
-                request.data = data
-            else:
-                request.add_data(data)
+            request.data = data
         return request
 
     def encode(self, params, files, boundary=None, buffer=None):
@@ -4391,42 +4340,42 @@ class FormPostHandler(urllib.request.BaseHandler):
             # We'll do this across both python 2/3 rather than add more branching.
             boundary = uuid.uuid4()
         if buffer is None:
-            buffer = BytesIO()
+            buffer = io.BytesIO()
         for (key, value) in params:
             if not isinstance(value, str):
                 # If value is not a string (e.g. int) cast to text
                 value = str(value)
-            value = sgutils.ensure_text(value)
-            key = sgutils.ensure_text(key)
+            if not isinstance(key, str):
+                # If key is not a string (e.g. int) cast to text
+                key = str(key)
 
-            buffer.write(sgutils.ensure_binary("--%s\r\n" % boundary))
-            buffer.write(sgutils.ensure_binary("Content-Disposition: form-data; name=\"%s\"" % key))
-            buffer.write(sgutils.ensure_binary("\r\n\r\n%s\r\n" % value))
+            buffer.write(("--%s\r\n" % boundary).encode(ENCODING))
+            buffer.write(("Content-Disposition: form-data; name=\"%s\"" % key).encode(ENCODING))
+            buffer.write(("\r\n\r\n%s\r\n" % value).encode(ENCODING))
         for (key, fd) in files:
             # On Windows, it's possible that we were forced to open a file
             # with non-ascii characters as unicode. In that case, we need to
             # encode it as a utf-8 string to remove unicode from the equation.
             # If we don't, the mix of unicode and strings going into the
             # buffer can cause UnicodeEncodeErrors to be raised.
-            filename = fd.name
-            filename = sgutils.ensure_text(filename)
-            filename = filename.split("/")[-1]
-            key = sgutils.ensure_text(key)
+            _, filename = os.path.split(fd.name)
+
             content_type = mimetypes.guess_type(filename)[0]
             content_type = content_type or "application/octet-stream"
             file_size = os.fstat(fd.fileno())[stat.ST_SIZE]
-            buffer.write(sgutils.ensure_binary("--%s\r\n" % boundary))
+            buffer.write(("--%s\r\n" % boundary).encode(ENCODING))
             c_dis = "Content-Disposition: form-data; name=\"%s\"; filename=\"%s\"%s"
             content_disposition = c_dis % (key, filename, "\r\n")
-            buffer.write(sgutils.ensure_binary(content_disposition))
-            buffer.write(sgutils.ensure_binary("Content-Type: %s\r\n" % content_type))
-            buffer.write(sgutils.ensure_binary("Content-Length: %s\r\n" % file_size))
+            buffer.write((content_disposition).encode(ENCODING))
+            buffer.write(("Content-Type: %s\r\n" % content_type).encode(ENCODING))
+            buffer.write(("Content-Length: %s\r\n" % file_size).encode(ENCODING))
 
-            buffer.write(sgutils.ensure_binary("\r\n"))
+            buffer.write(("\r\n").encode(ENCODING))
             fd.seek(0)
             shutil.copyfileobj(fd, buffer)
-            buffer.write(sgutils.ensure_binary("\r\n"))
-        buffer.write(sgutils.ensure_binary("--%s--\r\n\r\n" % boundary))
+            buffer.write(("\r\n").encode(ENCODING))
+
+        buffer.write(("--%s--\r\n\r\n" % boundary).encode(ENCODING))
         buffer = buffer.getvalue()
         return boundary, buffer
 
@@ -4523,7 +4472,7 @@ def _get_type_and_id_from_value(value):
         if isinstance(value, dict):
             return {"type": value["type"], "id": value["id"]}
         elif isinstance(value, list):
-            return [{"type": v["type"], "id": v["id"]} for v in value]    
+            return [{"type": v["type"], "id": v["id"]} for v in value]
     except (KeyError, TypeError):
         LOG.debug(f"Could not optimize entity value {value}")
 
